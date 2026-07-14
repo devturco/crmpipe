@@ -1,0 +1,110 @@
+# Dockerfile.railway — Railway-compatible build for the Twenty backend.
+#
+# This is a Railway-friendly variant of packages/twenty-docker/twenty/Dockerfile
+# that drops the VOLUME instruction (Railway rejects it at parse time).
+# It builds the same `twenty-server` stage (NestJS API + worker) without
+# the all-in-one stages (postgres/redis/frontend).
+#
+# Targets:
+#   - default (twenty-server): NestJS API only. Run with `node dist/main.js`.
+#   - worker: same image but runs `node dist/queue-worker/queue-worker.js`.
+
+# ============================================================================
+# Stage: base node image with deps
+# ============================================================================
+FROM node:24.18.0-alpine AS base
+
+RUN apk add --no-cache \
+      python3 \
+      make \
+      g++ \
+      openssl \
+      curl \
+      tini \
+    && corepack enable
+
+WORKDIR /app
+
+# Copy workspace root
+COPY package.json yarn.lock .yarnrc.yml ./
+COPY .yarn ./.yarn
+COPY tsconfig.base.json ./
+
+# ============================================================================
+# Stage: install all monorepo dependencies
+# ============================================================================
+FROM base AS deps
+
+WORKDIR /app
+
+# Copy package.json files for the workspace packages we need
+COPY packages/twenty-server/package.json ./packages/twenty-server/
+COPY packages/twenty-shared/package.json ./packages/twenty-shared/
+COPY packages/twenty-ui/package.json ./packages/twenty-ui/
+COPY packages/twenty-emails/package.json ./packages/twenty-emails/
+COPY packages/twenty-website/package.json ./packages/twenty-website/
+COPY packages/twenty-front/package.json ./packages/twenty-front/
+COPY packages/twenty-utils/package.json ./packages/twenty-utils/
+
+# Install dependencies (skip lifecycle scripts; we run them after copy)
+RUN yarn install --immutable
+
+# ============================================================================
+# Stage: build the server
+# ============================================================================
+FROM deps AS build
+
+WORKDIR /app
+
+# Copy source for needed packages
+COPY packages/twenty-server ./packages/twenty-server
+COPY packages/twenty-shared ./packages/twenty-shared
+COPY packages/twenty-ui ./packages/twenty-ui
+COPY packages/twenty-utils ./packages/twenty-utils
+
+# Build server
+RUN yarn workspace twenty-server build
+
+# Prune dev dependencies for runtime
+RUN yarn install --immutable --production
+
+# ============================================================================
+# Stage: twenty-server runtime (default)
+# ============================================================================
+FROM node:24.18.0-alpine AS twenty-server
+
+RUN apk add --no-cache openssl tini
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+
+COPY --from=build /app/package.json /app/yarn.lock /app/.yarnrc.yml ./
+COPY --from=build /app/.yarn ./.yarn
+COPY --from=build /app/packages/twenty-server/package.json ./packages/twenty-server/
+COPY --from=build /app/packages/twenty-server/dist ./packages/twenty-server/dist
+COPY --from=build /app/packages/twenty-server/node_modules ./packages/twenty-server/node_modules
+COPY --from=build /app/packages/twenty-shared ./packages/twenty-shared
+COPY --from=build /app/packages/twenty-ui ./packages/twenty-ui
+COPY --from=build /app/packages/twenty-utils ./packages/twenty-utils
+COPY --from=build /app/node_modules ./node_modules
+
+WORKDIR /app/packages/twenty-server
+
+USER node
+
+EXPOSE 3000
+
+# API default: NestJS server. Override CMD for worker via target below.
+CMD ["node", "dist/main.js"]
+
+# ============================================================================
+# Stage: worker (BullMQ jobs runner)
+# ============================================================================
+FROM twenty-server AS worker
+
+WORKDIR /app/packages/twenty-server
+
+USER node
+
+CMD ["node", "dist/queue-worker/queue-worker.js"]
